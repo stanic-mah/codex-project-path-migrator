@@ -27,6 +27,9 @@ REGISTRY_ARRAY_KEYS = {
     "project-order",
     "active-workspace-roots",
 }
+THREAD_WORKSPACE_ROOT_HINTS_KEY = "thread-workspace-root-hints"
+PROJECTLESS_THREAD_IDS_KEY = "projectless-thread-ids"
+THREAD_PROJECTLESS_OUTPUT_DIRS_KEY = "thread-projectless-output-directories"
 
 
 def strip_long_prefix(value: str) -> str:
@@ -180,7 +183,14 @@ def wait_for_codex_exit(seconds: int) -> None:
     raise TimeoutError("Timed out waiting for Codex Desktop to close")
 
 
-def update_registry(codex_home: Path, old_plain: str, new_plain: str, stamp: str, dry_run: bool) -> list[dict[str, Any]]:
+def update_registry(
+    codex_home: Path,
+    old_plain: str,
+    new_plain: str,
+    selected_ids: list[str],
+    stamp: str,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for name in REGISTRY_FILES:
         path = codex_home / name
@@ -193,6 +203,37 @@ def update_registry(codex_home: Path, old_plain: str, new_plain: str, stamp: str
         for key in REGISTRY_ARRAY_KEYS:
             if isinstance(data, dict) and isinstance(data.get(key), list):
                 data[key] = dedupe_path_array(data[key])
+        registry_notes: dict[str, Any] = {}
+        if isinstance(data, dict) and selected_ids:
+            hints = data.setdefault(THREAD_WORKSPACE_ROOT_HINTS_KEY, {})
+            if isinstance(hints, dict):
+                added_or_updated = []
+                for thread_id in selected_ids:
+                    if hints.get(thread_id) != new_plain:
+                        hints[thread_id] = new_plain
+                        added_or_updated.append(thread_id)
+                if added_or_updated:
+                    registry_notes["workspace_root_hints"] = added_or_updated
+
+            projectless = data.get(PROJECTLESS_THREAD_IDS_KEY)
+            if isinstance(projectless, list):
+                selected = set(selected_ids)
+                kept_projectless = [thread_id for thread_id in projectless if thread_id not in selected]
+                if kept_projectless != projectless:
+                    registry_notes["removed_projectless_thread_ids"] = [
+                        thread_id for thread_id in projectless if thread_id in selected
+                    ]
+                    data[PROJECTLESS_THREAD_IDS_KEY] = kept_projectless
+
+            output_dirs = data.get(THREAD_PROJECTLESS_OUTPUT_DIRS_KEY)
+            if isinstance(output_dirs, dict):
+                removed_outputs = []
+                for thread_id in selected_ids:
+                    if thread_id in output_dirs:
+                        removed_outputs.append(thread_id)
+                        output_dirs.pop(thread_id, None)
+                if removed_outputs:
+                    registry_notes["removed_projectless_output_dirs"] = removed_outputs
         updated = json.dumps(data, ensure_ascii=False, indent=2)
         changed = updated != original
         if changed:
@@ -200,7 +241,14 @@ def update_registry(codex_home: Path, old_plain: str, new_plain: str, stamp: str
             write_text_utf8_no_bom(path, updated, dry_run)
         else:
             backup = None
-        results.append({"file": str(path), "status": "updated" if changed else "unchanged", "backup": str(backup) if backup else None})
+        item: dict[str, Any] = {
+            "file": str(path),
+            "status": "updated" if changed else "unchanged",
+            "backup": str(backup) if backup else None,
+        }
+        if registry_notes:
+            item["project_sidebar"] = registry_notes
+        results.append(item)
     return results
 
 
@@ -301,6 +349,38 @@ def verify_db(db_path: Path, thread_ids: list[str], new_plain: str) -> list[dict
         con.close()
 
 
+def verify_registry(codex_home: Path, thread_ids: list[str], new_plain: str) -> list[dict[str, Any]]:
+    if not thread_ids:
+        return []
+    results: list[dict[str, Any]] = []
+    new_key = path_key(new_plain)
+    for name in REGISTRY_FILES:
+        path = codex_home / name
+        if not path.exists():
+            results.append({"file": str(path), "status": "missing"})
+            continue
+        data = json.loads(read_text_utf8(path))
+        projectless = data.get(PROJECTLESS_THREAD_IDS_KEY, [])
+        output_dirs = data.get(THREAD_PROJECTLESS_OUTPUT_DIRS_KEY, {})
+        hints = data.get(THREAD_WORKSPACE_ROOT_HINTS_KEY, {})
+        results.append(
+            {
+                "file": str(path),
+                "projectless_remaining": [
+                    thread_id for thread_id in thread_ids if isinstance(projectless, list) and thread_id in projectless
+                ],
+                "projectless_output_dirs_remaining": [
+                    thread_id for thread_id in thread_ids if isinstance(output_dirs, dict) and thread_id in output_dirs
+                ],
+                "workspace_root_hints_match": {
+                    thread_id: isinstance(hints, dict) and path_key(str(hints.get(thread_id, ""))) == new_key
+                    for thread_id in thread_ids
+                },
+            }
+        )
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Remap Codex project path metadata without syncing files.")
     parser.add_argument("--old", required=True, help="Old saved Codex project path")
@@ -334,12 +414,13 @@ def main() -> int:
         "codex_home": str(codex_home),
         "state_db": str(db_path),
         "selected_threads": [{"id": row["id"], "title": row["title"], "old_cwd": row["cwd"]} for row in rows],
-        "registry": update_registry(codex_home, old_plain, new_plain, stamp, args.dry_run),
+        "registry": update_registry(codex_home, old_plain, new_plain, selected_ids, stamp, args.dry_run),
         "database": update_thread_db(db_path, rows, new_plain, stamp, args.dry_run),
         "sessions": update_session_files(rows, old_plain, new_plain, stamp, args.dry_run),
     }
     if not args.dry_run:
         summary["verification"] = verify_db(db_path, selected_ids, new_plain)
+        summary["registry_verification"] = verify_registry(codex_home, selected_ids, new_plain)
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
