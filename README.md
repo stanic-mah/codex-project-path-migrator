@@ -1,9 +1,14 @@
 # Codex Project Path Migrator
 
-A Codex skill for updating a saved Codex Desktop project folder path while keeping the existing chat history attached to that project.
+A Codex skill and helper script for moving Codex Desktop chat history between project folders, including moving standalone/global **Chats** into a saved project folder.
 
-This skill is for path metadata only. It does not copy, sync, merge, move, or delete files between the old and new project folders.
-It also handles the sidebar metadata needed when a standalone/global chat should appear under an existing project.
+This is a metadata repair tool. It updates Codex's saved project registry, thread database rows, session JSONL path references, and sidebar classification state. It does not copy, sync, merge, move, or delete project files.
+
+Use it when Codex shows a conversation in the wrong place, for example:
+
+- A project folder was renamed or moved.
+- Existing project chats disappeared after changing paths.
+- A chat still appears under global **Chats** when it should live under a project.
 
 ## What It Does
 
