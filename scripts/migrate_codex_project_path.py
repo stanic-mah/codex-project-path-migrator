@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -66,13 +67,24 @@ def json_escaped(value: str) -> str:
 
 
 def replace_path_text(text: str, old_plain: str, new_plain: str) -> str:
+    old_plain = clean_path(old_plain)
+    new_plain = clean_path(new_plain)
     old_long = long_path(old_plain)
     new_long = long_path(new_plain)
-    pairs = [
-        (json_escaped(old_long), json_escaped(new_long)),
-        (json_escaped(old_plain), json_escaped(new_plain)),
+    old_slash = old_plain.replace("\\", "/")
+    new_slash = new_plain.replace("\\", "/")
+    old_long_slash = old_long.replace("\\", "/")
+    new_long_slash = new_long.replace("\\", "/")
+    path_pairs = [
         (old_long, new_long),
         (old_plain, new_plain),
+        (old_long_slash, new_long_slash),
+        (old_slash, new_slash),
+    ]
+    pairs = [
+        pair
+        for old, new in path_pairs
+        for pair in ((json_escaped(old), json_escaped(new)), (old, new))
     ]
     seen: set[tuple[str, str]] = set()
     for old, new in pairs:
@@ -169,18 +181,70 @@ def codex_ui_running() -> bool:
     return False
 
 
-def wait_for_codex_exit(seconds: int) -> None:
+def wait_for_codex_exit(seconds: int, stable_seconds: int = 5, status_stream: Any = None) -> None:
     if seconds <= 0:
         return
-    deadline = time.time() + seconds
-    print(f"Waiting up to {seconds}s for Codex Desktop to close...")
-    while time.time() < deadline:
-        if not codex_ui_running():
-            time.sleep(2)
-            print("Codex Desktop is closed; applying migration.")
-            return
-        time.sleep(2)
+    if stable_seconds < 0:
+        raise ValueError("--codex-exit-stable-seconds must be zero or greater")
+    if stable_seconds >= seconds:
+        raise ValueError("--codex-exit-stable-seconds must be less than --wait-for-codex-exit")
+    stream = status_stream if status_stream is not None else sys.stdout
+    deadline = time.monotonic() + seconds
+    closed_since: float | None = None
+    print(
+        f"Waiting up to {seconds}s for Codex Desktop to remain closed for {stable_seconds}s...",
+        file=stream,
+        flush=True,
+    )
+    while time.monotonic() < deadline:
+        now = time.monotonic()
+        if codex_ui_running():
+            closed_since = None
+        else:
+            if closed_since is None:
+                closed_since = now
+            if now - closed_since >= stable_seconds:
+                print("Codex Desktop is closed; applying migration.", file=stream, flush=True)
+                return
+        time.sleep(1)
     raise TimeoutError("Timed out waiting for Codex Desktop to close")
+
+
+def background_command(argv: list[str]) -> list[str]:
+    child_args = [arg for arg in argv if arg != "--background"]
+    return [sys.executable, str(Path(__file__).resolve()), *child_args]
+
+
+def launch_background(argv: list[str], log_dir: str | None) -> dict[str, Any]:
+    if os.name != "nt":
+        raise OSError("--background is currently supported on Windows only")
+    root = Path(log_dir).expanduser() if log_dir else Path(tempfile.gettempdir())
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stem = f"codex-project-path-migrator-{stamp}-{os.getpid()}"
+    stdout_suffix = ".json" if "--json" in argv else ".log"
+    stdout_path = root / f"{stem}{stdout_suffix}"
+    stderr_path = root / f"{stem}.err.log"
+    creationflags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+        creationflags |= int(getattr(subprocess, name, 0))
+    command = background_command(argv)
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    return {
+        "status": "queued",
+        "pid": process.pid,
+        "command": command,
+        "output_log": str(stdout_path),
+        "error_log": str(stderr_path),
+    }
 
 
 def update_registry(
@@ -389,6 +453,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codex-home", help="Codex home directory. Defaults to CODEX_HOME or %%USERPROFILE%%\\.codex.")
     parser.add_argument("--state-db", help="Path to Codex state sqlite database. Defaults to state_5.sqlite or newest state_*.sqlite.")
     parser.add_argument("--wait-for-codex-exit", type=int, default=0, metavar="SECONDS", help="Wait until Codex.exe closes before applying changes.")
+    parser.add_argument("--codex-exit-stable-seconds", type=int, default=5, metavar="SECONDS", help="Require Codex.exe to remain absent for this long before applying. Defaults to 5.")
+    parser.add_argument("--background", action="store_true", help="Queue a detached Windows helper and return immediately. Requires --wait-for-codex-exit.")
+    parser.add_argument("--log-dir", help="Directory for detached helper output. Defaults to the system temporary directory.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be changed without writing files.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary.")
     return parser.parse_args()
@@ -396,13 +463,45 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.background:
+        if args.dry_run:
+            raise ValueError("--background cannot be combined with --dry-run")
+        if args.wait_for_codex_exit <= 0:
+            raise ValueError("--background requires --wait-for-codex-exit")
+        queued = launch_background(sys.argv[1:], args.log_dir)
+        if args.json:
+            print(json.dumps(queued, ensure_ascii=False, indent=2))
+        else:
+            print("Codex project path migration queued")
+            print(f"pid: {queued['pid']}")
+            print(f"output log: {queued['output_log']}")
+            print(f"error log: {queued['error_log']}")
+        return 0
+
     old_plain = clean_path(args.old)
     new_plain = clean_path(args.new)
     codex_home = find_codex_home(args.codex_home)
     db_path = find_state_db(codex_home, args.state_db)
     stamp = time.strftime("%Y%m%d-%H%M%S")
 
-    wait_for_codex_exit(args.wait_for_codex_exit)
+    codex_running_before_wait = codex_ui_running()
+    warnings: list[str] = []
+    if codex_running_before_wait and args.wait_for_codex_exit <= 0 and not args.dry_run:
+        warning = (
+            "Codex Desktop is running and may restore projectless sidebar state. "
+            "Use --background --wait-for-codex-exit 1200 for a restart-safe repair."
+        )
+        warnings.append(warning)
+        print(f"warning: {warning}", file=sys.stderr, flush=True)
+
+    wait_for_codex_exit(
+        args.wait_for_codex_exit,
+        args.codex_exit_stable_seconds,
+        sys.stderr if args.json else sys.stdout,
+    )
+    codex_running_at_apply = codex_ui_running()
+    if args.wait_for_codex_exit > 0 and codex_running_at_apply:
+        raise RuntimeError("Codex Desktop restarted before the migration could be applied")
 
     rows = select_threads(db_path, old_plain, args.thread_id)
     selected_ids = [row["id"] for row in rows]
@@ -413,6 +512,11 @@ def main() -> int:
         "new_path": new_plain,
         "codex_home": str(codex_home),
         "state_db": str(db_path),
+        "codex_ui": {
+            "running_before_wait": codex_running_before_wait,
+            "running_at_apply": codex_running_at_apply,
+        },
+        "warnings": warnings,
         "selected_threads": [{"id": row["id"], "title": row["title"], "old_cwd": row["cwd"]} for row in rows],
         "registry": update_registry(codex_home, old_plain, new_plain, selected_ids, stamp, args.dry_run),
         "database": update_thread_db(db_path, rows, new_plain, stamp, args.dry_run),
@@ -440,4 +544,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
+        if "--json" in sys.argv[1:]:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
         raise SystemExit(1)

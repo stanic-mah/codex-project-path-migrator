@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Project Path Migrator"
-  short_description: "Remap Codex projects while keeping chats"
+  short_description: "Move Codex chats without losing history"
   brand_color: "#2563EB"
-  default_prompt: "Use $codex-project-path-migrator to update a Codex project folder path while keeping the existing chat history attached."
+  default_prompt: "Use $codex-project-path-migrator to move a Codex project or global chat while preserving history and repairing restart-sensitive sidebar state."
 policy:
   allow_implicit_invocation: true

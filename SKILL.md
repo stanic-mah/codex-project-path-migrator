@@ -1,8 +1,6 @@
 ---
 name: codex-project-path-migrator
-description: Use when a user wants to change, remap, migrate, or update a saved Codex project/workspace folder path while keeping existing Codex chat history/conversations attached to the project. This skill updates Codex metadata only, including saved project registry files, thread database cwd values, session JSONL path references, and projectless/global chat sidebar state. It must not copy, sync, merge, move, or delete project files between the old and new paths.
-metadata:
-  short-description: Remap Codex project paths without syncing files
+description: Remap a saved Codex project/workspace path or move selected standalone/global Chats into an existing project while preserving chat history. Use when a project folder moved or was renamed, chats disappeared from a project, a chat has the correct cwd but still appears under general Chats, or Codex restores projectless sidebar state after restart. Update Codex metadata only; never copy, sync, merge, move, or delete project files.
 ---
 
 # Codex Project Path Migrator
@@ -33,27 +31,30 @@ If the user asks to move only selected conversations or move a global **Chats** 
 ## Main Workflow
 
 1. Verify the new path is the intended saved project path. Do not sync files even if the folder contents differ.
-2. Locate Codex metadata:
+2. Resolve exact thread IDs for selected/global-chat migrations. Record each thread's `cwd` and `projectId` from `codex_app.list_threads`.
+3. Locate Codex metadata:
    - `CODEX_HOME`, usually `%USERPROFILE%\.codex`.
    - Saved project registry: `.codex-global-state.json` and `.codex-global-state.json.bak`.
    - Thread database: usually `state_5.sqlite`, or the newest `state_*.sqlite`.
    - Session files referenced by `threads.rollout_path`.
-3. Prefer the bundled script:
+4. Prefer the bundled script:
    - `scripts/migrate_codex_project_path.py`
-4. Back up all edited metadata files with a timestamp.
-5. Update saved project registry values such as:
+5. Run `--dry-run --json` first and inspect the exact selected threads and files.
+6. Back up all edited metadata files with a timestamp.
+7. Update saved project registry values such as:
    - `electron-saved-workspace-roots`
    - `project-order`
    - `active-workspace-roots`
    - `thread-workspace-root-hints`
-6. For selected migrated threads, also update project/sidebar classification:
+8. For selected migrated threads, also update project/sidebar classification:
    - Set `thread-workspace-root-hints[thread_id]` to the new project path.
    - Remove `thread_id` from `projectless-thread-ids`.
    - Remove `thread_id` from `thread-projectless-output-directories`.
-7. Update matching `threads.cwd` rows to the new long Windows path form, for example `\\?\C:\New\Project`.
-8. Update affected session JSONL files by replacing the old path with the new path, including JSON-escaped path forms.
-9. Write session JSONL files as UTF-8 without BOM. The first bytes must remain the first JSON session metadata line, not a UTF-8 marker.
-10. Verify:
+9. Update matching `threads.cwd` rows to the new long Windows path form, for example `\\?\C:\New\Project`.
+10. Update affected session JSONL files by replacing backslash, JSON-escaped, and forward-slash path forms.
+11. Write session JSONL files as UTF-8 without BOM. The first bytes must remain the first JSON session metadata line, not a UTF-8 marker.
+12. For a global-chat migration while Codex is open, queue the restart-safe background repair described below. Do not treat an immediate live-app write as final.
+13. After Codex is reopened, verify:
    - The new path appears in saved project roots or already exists as the target saved project.
    - The old path no longer appears in saved project roots when this is a path replacement.
    - The remapped thread rows have the new `cwd`.
@@ -61,20 +62,35 @@ If the user asks to move only selected conversations or move a global **Chats** 
    - Selected migrated threads are absent from `projectless-thread-ids`.
    - Selected migrated threads are absent from `thread-projectless-output-directories`.
    - `thread-workspace-root-hints[thread_id]` points to the new project path.
-   - `codex_app.list_threads` can find the remapped conversations under the new path.
+   - `codex_app.list_threads` reports the target project's non-null `projectId` for each migrated thread.
 
-## Experience Notes: Global Chat To Project
+## Restart-Safe Global Chat Repair
 
-In a real migration, changing `threads.cwd`, session JSONL `cwd` values, and `thread-workspace-root-hints` was not enough. The Codex app correctly reported the thread's `cwd` as the project path, but the sidebar still showed the conversation under global **Chats**.
+A new `cwd` is not proof that the sidebar migration succeeded. A task can report the target path while `projectId` remains null and the conversation stays under global **Chats**.
 
-The hidden cause was explicit projectless state in `.codex-global-state.json`:
+Inspect both `.codex-global-state.json` and its `.bak`. The usual cause is restored projectless state:
 
 - `projectless-thread-ids` still contained the thread IDs.
 - `thread-projectless-output-directories` still mapped those thread IDs to the old disposable chat workspace.
+- `thread-workspace-root-hints` reverted to the general Codex output root.
 
-After removing those projectless entries and keeping `thread-workspace-root-hints` pointed at the project, the chat appeared under the project folder. Because the running Codex Desktop app can rewrite `.codex-global-state.json` from memory, the successful repair had to run after all Codex windows were closed.
+Codex can restore these values from memory during shutdown or the next startup even when an immediate migration and registry verification passed. Apply the final write only after every `Codex.exe` process has remained absent for a stable interval.
 
-Do not keep repeating database edits when `codex_app.list_threads` already reports the correct project `cwd`. At that point, inspect and repair the projectless sidebar keys.
+Use the script's detached mode from an active Codex task:
+
+```powershell
+python scripts/migrate_codex_project_path.py `
+  --old "C:\Old\StandaloneChatWorkspace" `
+  --new "C:\New\Project" `
+  --thread-id 019e... `
+  --background `
+  --wait-for-codex-exit 1200 `
+  --json
+```
+
+The parent command returns immediately with a PID and output/error log paths. Ask the user to close all Codex windows, leave Codex closed for at least 10 seconds, and reopen it. The detached helper preserves paths containing spaces, waits for Codex to remain absent for 5 seconds by default, then applies the backed-up migration. Read its logs and run the post-restart verification before claiming completion.
+
+Do not hand-build a `Start-Process -ArgumentList` command for this workflow; unquoted paths containing spaces can be split silently. Use `--background`.
 
 ## Running The Script
 
@@ -92,20 +108,22 @@ Example for selected chats only:
 python scripts/migrate_codex_project_path.py --old "C:\Old\Project" --new "C:\New\Project" --thread-id 019e... --thread-id 019e...
 ```
 
-For a global **Chats** item that should move under an existing project, use the selected thread ID and close Codex before the final write if the sidebar resists updating:
+For a global **Chats** item, first preview the selected-thread change:
 
 ```powershell
-python scripts/migrate_codex_project_path.py --old "C:\Old\StandaloneChatWorkspace" --new "C:\New\Project" --thread-id 019e... --wait-for-codex-exit 1200
+python scripts/migrate_codex_project_path.py --old "C:\Old\StandaloneChatWorkspace" --new "C:\New\Project" --thread-id 019e... --dry-run --json
 ```
 
-The wait option applies the migration only after no `Codex.exe` UI process remains, up to the given number of seconds.
+Then use `--background --wait-for-codex-exit 1200 --json` as shown above. Use `--log-dir` to choose a log directory and `--codex-exit-stable-seconds` only when the default 5-second stable-close window is unsuitable.
 
 ## Important Pitfalls
 
 - PowerShell 5.1 `Set-Content -Encoding UTF8` can write a UTF-8 BOM. Do not use it for session JSONL files.
 - Update both `.codex-global-state.json` and `.codex-global-state.json.bak`; otherwise Codex may restore the old path or stale sidebar state.
-- A running Codex Desktop window can rewrite the saved project registry from memory. If the UI still shows the old tooltip or global **Chats** placement, close all Codex windows and rerun or use the wait option.
+- A live-app migration can pass its immediate checks and still be undone during shutdown or restart. Use the detached close-wait workflow for global chats.
 - A thread can have the correct `threads.cwd` and still show under global **Chats** when `projectless-thread-ids` still contains its ID.
+- A `codex_app.list_threads` entry with the target `cwd` but `projectId: null` is not migrated successfully.
 - Stale `thread-projectless-output-directories` entries should be removed for selected threads moved into a project.
+- Keep `--json` stdout machine-readable; detached wait progress goes to the error log.
 - Do not use destructive Git or filesystem commands for this task.
 - Do not copy project files unless the user makes a separate explicit request after this path-only migration.
